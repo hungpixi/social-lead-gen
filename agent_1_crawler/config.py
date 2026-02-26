@@ -12,9 +12,14 @@ GROUPS = [
         "keywords": ["AI", "startup", "khởi nghiệp", "automation", "tìm team"],
     },
     {
-        "url": "https://www.facebook.com/groups/AIVietnam",
-        "name": "AI Vietnam",
-        "keywords": ["AI agent", "llm", "chatbot", "machine learning"],
+        "url": "https://www.facebook.com/groups/nghiencuusinhhoc",
+        "name": "Khoa học Việt Nam",
+        "keywords": ["AI", "công nghệ", "nghiên cứu", "phát triển"],
+    },
+    {
+        "url": "https://www.facebook.com/groups/j2team.community",
+        "name": "J2Team Community",
+        "keywords": ["AI", "chatbot", "automation", "tool", "lập trình"],
     },
     # Thêm group mới ở đây:
     # {

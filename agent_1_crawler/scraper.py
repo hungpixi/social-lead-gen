@@ -1,246 +1,362 @@
 """
-Agent 1 — Facebook Group Scraper.
-Sử dụng thư viện facebook-scraper (3.1k ⭐ trên GitHub).
-Repo: https://github.com/kevinzg/facebook-scraper
-
-Chi phí: $0 (không cần API key).
+Agent 1 — Facebook Group Scraper (Playwright + JS evaluate).
+Dùng browser thật + JS evaluate trực tiếp để vượt qua Facebook lazy virtualization.
 """
 
 import json
 import os
+import re
+import time
 from pathlib import Path
-from datetime import datetime
 
 from loguru import logger
-
-try:
-    from facebook_scraper import (
-        get_posts,
-        get_group_info,
-        get_profile,
-        set_cookies,
-        enable_logging,
-    )
-except ImportError:
-    logger.error("Chưa cài facebook-scraper. Chạy: pip install facebook-scraper")
-    raise
 
 from agent_1_crawler.config import (
     MAX_POSTS_PER_SCAN,
     MAX_COMMENTS_PER_POST,
+    SCROLL_DELAY_MS,
 )
 from database.db import save_comments_batch
 
 
+# ─── Paths ────────────────────────────────────────────────
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+COOKIE_PATH = DATA_DIR / "fb_cookies.json"
+COOKIE_TXT_PATH = DATA_DIR / "fb_cookies.txt"
+
+
 # ─── Cookie Management ───────────────────────────────────
-COOKIE_PATH = Path(__file__).resolve().parent.parent / "data" / "fb_cookies.txt"
+def _parse_netscape_cookies(path: Path) -> list[dict]:
+    """Parse Netscape cookies.txt thành list dicts cho Playwright."""
+    cookies = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies.append({
+                    "name": parts[5],
+                    "value": parts[6],
+                    "domain": parts[0],
+                    "path": parts[2] if len(parts) > 2 else "/",
+                    "secure": parts[3].upper() == "TRUE" if len(parts) > 3 else False,
+                })
+    return cookies
 
 
-def _load_cookies() -> str | None:
-    """Load cookies từ file (Netscape format hoặc JSON)."""
+def _load_cookies() -> list[dict]:
     if COOKIE_PATH.exists():
-        logger.info(f"Loading cookies from {COOKIE_PATH}")
-        return str(COOKIE_PATH)
-    # Thử tự động lấy từ browser
-    logger.info("No cookie file found. Trying 'from_browser'...")
-    return "from_browser"
+        with open(COOKIE_PATH, "r") as f:
+            return json.load(f)
+    if COOKIE_TXT_PATH.exists():
+        return _parse_netscape_cookies(COOKIE_TXT_PATH)
+    return []
+
+
+def _save_cookies(context) -> None:
+    cookies = context.cookies()
+    COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(COOKIE_PATH, "w") as f:
+        json.dump(cookies, f, indent=2)
+    logger.info(f"Saved {len(cookies)} cookies")
+
+
+# ─── Login ────────────────────────────────────────────────
+def _ensure_login(page, context) -> bool:
+    page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
+    time.sleep(3)
+    url = page.url
+    content = page.content()
+
+    if "/login" in url or "login_form" in content:
+        logger.warning("⚠️  Chưa login. Hãy login trong browser vừa mở...")
+        for _ in range(24):
+            time.sleep(5)
+            if "/login" not in page.url and "checkpoint" not in page.url:
+                logger.success("✅ Login thành công!")
+                _save_cookies(context)
+                return True
+        logger.error("❌ Timeout login 120s.")
+        return False
+
+    logger.success("✅ Đã login Facebook.")
+    _save_cookies(context)
+    return True
+
+
+# ─── Extract Posts (JS evaluate) ──────────────────────────
+JS_EXTRACT_POSTS = """
+() => {
+    const msgs = document.querySelectorAll('[data-ad-comet-preview="message"]');
+    const results = [];
+    
+    msgs.forEach((msgEl) => {
+        const text = msgEl.innerText.trim();
+        if (text.length < 3) return;
+        
+        // Walk up DOM to find post container
+        let container = msgEl;
+        for (let j = 0; j < 20; j++) {
+            if (!container.parentElement) break;
+            container = container.parentElement;
+            const role = container.getAttribute('role');
+            if (role === 'feed' || role === 'main') break;
+        }
+        
+        // Author (first meaningful <strong>)
+        let authorName = '';
+        for (const s of container.querySelectorAll('strong')) {
+            const t = s.innerText.trim();
+            if (t.length > 1 && t.length < 50 && t !== 'Facebook') {
+                authorName = t;
+                break;
+            }
+        }
+        
+        // Author URL
+        let authorUrl = '';
+        for (const a of container.querySelectorAll('a[role="link"]')) {
+            const href = a.href || '';
+            if (href.includes('facebook.com/') && !href.includes('/groups/')) {
+                authorUrl = href;
+                break;
+            }
+        }
+        
+        // Post URL
+        const postLinks = container.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]');
+        const postUrl = postLinks.length > 0 ? postLinks[0].href : '';
+        
+        results.push({
+            post_id: text.substring(0, 80),
+            text: text.substring(0, 1000),
+            author: authorName,
+            author_url: authorUrl,
+            post_url: postUrl,
+        });
+    });
+    
+    return results;
+}
+"""
+
+JS_EXTRACT_COMMENTS = """
+(args) => {
+    const [postPrefix, maxCmt] = args;
+    const msgs = document.querySelectorAll('[data-ad-comet-preview="message"]');
+    let targetContainer = null;
+    
+    for (const msg of msgs) {
+        if (msg.innerText.trim().startsWith(postPrefix)) {
+            targetContainer = msg;
+            for (let j = 0; j < 20; j++) {
+                if (!targetContainer.parentElement) break;
+                targetContainer = targetContainer.parentElement;
+                const role = targetContainer.getAttribute('role');
+                if (role === 'feed' || role === 'main') break;
+            }
+            break;
+        }
+    }
+    
+    if (!targetContainer) return [];
+    
+    const comments = [];
+    const allText = targetContainer.querySelectorAll('ul div[dir="auto"], li div[dir="auto"]');
+    
+    for (const el of allText) {
+        const text = el.innerText.trim();
+        if (text.length < 2 || text === 'Facebook' || text.startsWith(postPrefix)) continue;
+        
+        let parent = el.parentElement;
+        let authorName = '', authorUrl = '';
+        for (let j = 0; j < 5; j++) {
+            if (!parent) break;
+            const link = parent.querySelector('a[role="link"]');
+            if (link) {
+                authorName = link.innerText.trim();
+                authorUrl = link.href || '';
+                break;
+            }
+            parent = parent.parentElement;
+        }
+        
+        if (!comments.some(c => c.text === text)) {
+            comments.push({ text: text.substring(0, 500), author: authorName, author_url: authorUrl });
+        }
+        if (comments.length >= maxCmt) break;
+    }
+    return comments;
+}
+"""
+
+
+def _scroll_and_collect(page, max_posts: int = 20) -> list[dict]:
+    """Scroll group + extract posts bằng JS evaluate."""
+    time.sleep(5)  # Chờ FB render ban đầu
+
+    collected_ids = set()
+    all_posts = []
+
+    for scroll_round in range(max_posts):
+        page.evaluate(f"window.scrollTo(0, {(scroll_round + 1) * 600})")
+        time.sleep(SCROLL_DELAY_MS / 1000 + 1)
+
+        new_posts = page.evaluate(JS_EXTRACT_POSTS)
+
+        for post in new_posts:
+            pid = post["post_id"]
+            if pid not in collected_ids:
+                collected_ids.add(pid)
+                all_posts.append({
+                    "post_id": str(hash(pid)),
+                    "post_text": post["text"],
+                    "post_url": post["post_url"],
+                    "post_author": post["author"],
+                    "post_author_url": post["author_url"],
+                })
+                logger.debug(f"  📝 '{post['text'][:50]}...' by {post['author']}")
+
+        if len(all_posts) >= max_posts:
+            break
+
+        at_bottom = page.evaluate(
+            "window.innerHeight + window.scrollY >= document.body.scrollHeight - 200"
+        )
+        if at_bottom and scroll_round > 3:
+            break
+
+    return all_posts[:max_posts]
 
 
 # ─── Scrape Group ────────────────────────────────────────
-def scrape_group(
-    group_id: str,
-    group_name: str = "",
-    keywords: list[str] | None = None,
-    pages: int = 3,
-    cookies: str | None = None,
-) -> int:
-    """
-    Cào posts + comments từ 1 Facebook Group.
-
-    Args:
-        group_id: ID hoặc tên group (ví dụ: "StartupVietnam" hoặc "123456789")
-        group_name: Tên hiển thị
-        keywords: Lọc bài viết theo từ khoá (optional)
-        pages: Số trang cần quét (mỗi trang ~4 posts mặc định)
-        cookies: Đường dẫn file cookies hoặc "from_browser"
-
-    Returns:
-        Số comments đã lưu mới.
-    """
-    cookie_source = cookies or _load_cookies()
+def scrape_group(group_id, group_name="", keywords=None, page_obj=None, context=None) -> int:
     all_comments = []
+    group_url = f"https://www.facebook.com/groups/{group_id}/"
 
-    logger.info(f"🕷️  Scraping group: {group_name or group_id} ({pages} pages)...")
+    logger.info(f"🕷️  Navigating to: {group_name or group_id}...")
 
     try:
-        post_count = 0
-        for post in get_posts(
-            group=group_id,
-            pages=pages,
-            cookies=cookie_source,
-            options={
-                "comments": MAX_COMMENTS_PER_POST,
-                "allow_extra_requests": True,
-                "posts_per_page": 10,
-            },
-            timeout=30,
-        ):
-            post_count += 1
-            if post_count > MAX_POSTS_PER_SCAN:
-                break
+        page_obj.goto(group_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
 
-            post_text = post.get("text") or post.get("post_text") or ""
+        page_text = page_obj.inner_text("body")[:500]
+        if "isn't available" in page_text:
+            logger.warning(f"Group {group_id} không tồn tại hoặc bạn chưa join.")
+            return 0
 
-            # Lọc theo keywords (nếu có)
-            if keywords:
-                combined = (post_text + " " + str(post.get("comments", ""))).lower()
-                if not any(kw.lower() in combined for kw in keywords):
+        logger.info("📄 Scrolling and collecting posts...")
+        posts = _scroll_and_collect(page_obj, max_posts=MAX_POSTS_PER_SCAN)
+        logger.info(f"   Found {len(posts)} posts")
+
+        for i, post in enumerate(posts):
+            post_text = post["post_text"]
+
+            if keywords and not any(kw.lower() in post_text.lower() for kw in keywords):
+                continue
+
+            comments = page_obj.evaluate(JS_EXTRACT_COMMENTS, [post_text[:40], MAX_COMMENTS_PER_POST])
+
+            for cmt in comments:
+                if not cmt["text"].strip():
                     continue
-
-            post_id = post.get("post_id") or f"fb_{datetime.now().strftime('%Y%m%d%H%M%S')}_{post_count}"
-            post_url = post.get("post_url") or ""
-            post_author = post.get("username") or post.get("user_id") or ""
-
-            # Lấy comments
-            comments_data = post.get("comments_full") or []
-            if not comments_data:
-                # Nếu không có comments_full, thử comments
-                comments_data = post.get("comments") or []
-
-            for comment in comments_data:
-                comment_text = ""
-                author_name = ""
-                author_url = ""
-
-                if isinstance(comment, dict):
-                    comment_text = comment.get("comment_text") or ""
-                    author_name = comment.get("commenter_name") or ""
-                    commenter_url = comment.get("commenter_url") or ""
-                    author_url = commenter_url
-                elif isinstance(comment, str):
-                    comment_text = comment
-
-                if not comment_text.strip():
-                    continue
-
                 all_comments.append({
-                    "post_id": str(post_id),
-                    "post_url": str(post_url),
+                    "post_id": post["post_id"],
+                    "post_url": post["post_url"],
                     "post_content": post_text[:500],
-                    "post_author": str(post_author),
-                    "comment_text": comment_text.strip(),
-                    "author_name": author_name,
-                    "author_profile_url": author_url,
+                    "post_author": post["post_author"],
+                    "comment_text": cmt["text"],
+                    "author_name": cmt["author"],
+                    "author_profile_url": cmt["author_url"],
                     "has_real_avatar": 0,
                     "source_group": group_name or group_id,
                 })
 
-            logger.debug(
-                f"Post {post_count}: {len(comments_data)} comments "
-                f"('{post_text[:50]}...')"
-            )
+            logger.debug(f"Post {i+1}: {len(comments)} cmt — '{post_text[:40]}...'")
 
+            # Nếu post không có comments → lưu post trực tiếp vào DB
+            # (để classify nội dung bài viết tìm leads)
+            if not comments:
+                all_comments.append({
+                    "post_id": post["post_id"],
+                    "post_url": post["post_url"],
+                    "post_content": post_text[:500],
+                    "post_author": post["post_author"],
+                    "comment_text": post_text[:500],
+                    "author_name": post["post_author"],
+                    "author_profile_url": post["post_author_url"],
+                    "has_real_avatar": 0,
+                    "source_group": group_name or group_id,
+                })
     except Exception as e:
-        logger.error(f"Scrape error for {group_name or group_id}: {e}")
-        if "cookies" in str(e).lower() or "login" in str(e).lower():
-            logger.warning(
-                "⚠️  Cookie lỗi/hết hạn. Hãy export cookies từ trình duyệt:\n"
-                "   1. Cài extension 'Get cookies.txt LOCALLY' trên Chrome\n"
-                "   2. Vào facebook.com, click extension → Export\n"
-                f"   3. Lưu file vào: {COOKIE_PATH}"
-            )
+        logger.error(f"Scrape error: {e}")
 
-    # Lưu vào DB
     saved = 0
     if all_comments:
         saved = save_comments_batch(all_comments)
 
-    logger.success(
-        f"Done: {group_name or group_id} — "
-        f"{post_count} posts, {len(all_comments)} comments, {saved} new saved"
-    )
+    logger.success(f"Done: {group_name or group_id} — {len(posts)} posts, {len(all_comments)} cmt, {saved} new")
     return saved
 
 
-# ─── Scrape Group Info ───────────────────────────────────
-def get_group_details(group_id: str, cookies: str | None = None) -> dict:
-    """Lấy thông tin tổng quan của group."""
-    cookie_source = cookies or _load_cookies()
-    try:
-        info = get_group_info(group_id, cookies=cookie_source)
-        logger.info(f"Group info: {info.get('name', group_id)} — {info.get('members', '?')} members")
-        return info
-    except Exception as e:
-        logger.error(f"Get group info failed: {e}")
-        return {}
-
-
-# ─── Scrape Profile ─────────────────────────────────────
-def get_user_profile(username: str, cookies: str | None = None) -> dict:
-    """Lấy thông tin profile của 1 user."""
-    cookie_source = cookies or _load_cookies()
-    try:
-        profile = get_profile(username, cookies=cookie_source)
-        return profile
-    except Exception as e:
-        logger.error(f"Get profile failed for {username}: {e}")
-        return {}
+# ─── Utils ────────────────────────────────────────────────
+def _extract_group_id(url: str) -> str:
+    match = re.search(r'facebook\.com/groups/([^/?&]+)', url)
+    return match.group(1) if match else url.strip("/").split("/")[-1]
 
 
 # ─── Run All Groups ──────────────────────────────────────
-def run_crawler(groups: list[dict] | None = None) -> int:
-    """
-    Chạy crawler cho tất cả groups.
-    Returns: Tổng số comments mới.
-    """
-    from database.db import get_active_groups
+def run_crawler(groups=None) -> int:
+    from playwright.sync_api import sync_playwright
     from agent_1_crawler.config import GROUPS as DEFAULT_GROUPS
 
-    targets = groups or []
-    if not targets:
-        db_groups = get_active_groups()
-        if db_groups:
-            targets = db_groups
-        else:
-            targets = DEFAULT_GROUPS
-
+    targets = groups or DEFAULT_GROUPS
+    cookies = _load_cookies()
+    headless = os.getenv("HEADLESS", "false").lower() == "true"
     total = 0
-    for group in targets:
-        url = group.get("url") or group.get("group_url", "")
-        name = group.get("name") or group.get("group_name", "")
-        keywords = group.get("keywords", [])
-        if isinstance(keywords, str):
-            keywords = json.loads(keywords)
 
-        # Trích xuất group ID từ URL
-        group_id = _extract_group_id(url) if url else ""
-        if not group_id:
-            logger.warning(f"Cannot extract group ID from: {url}")
-            continue
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+            locale="vi-VN",
+        )
 
-        try:
-            saved = scrape_group(group_id, name, keywords)
-            total += saved
-        except Exception as e:
-            logger.error(f"Failed to scrape {name}: {e}")
-            continue
+        if cookies:
+            context.add_cookies(cookies)
+            logger.info(f"Loaded {len(cookies)} cookies")
+
+        page = context.new_page()
+
+        if not _ensure_login(page, context):
+            browser.close()
+            return 0
+
+        for group in targets:
+            url = group.get("url") or group.get("group_url", "")
+            name = group.get("name") or group.get("group_name", "")
+            kw = group.get("keywords", [])
+            if isinstance(kw, str):
+                kw = json.loads(kw)
+
+            group_id = _extract_group_id(url) if url else ""
+            if not group_id:
+                continue
+
+            try:
+                total += scrape_group(group_id, name, kw, page_obj=page, context=context)
+            except Exception as e:
+                logger.error(f"Failed {name}: {e}")
+
+        _save_cookies(context)
+        browser.close()
 
     return total
 
 
-def _extract_group_id(url: str) -> str:
-    """Trích xuất group ID/name từ URL Facebook."""
-    import re
-    # https://www.facebook.com/groups/StartupVietnam → StartupVietnam
-    # https://www.facebook.com/groups/123456789 → 123456789
-    match = re.search(r'facebook\.com/groups/([^/?&]+)', url)
-    if match:
-        return match.group(1)
-    return url.strip("/").split("/")[-1]
-
-
-# ─── Entry Point ─────────────────────────────────────────
 if __name__ == "__main__":
-    import asyncio
     total = run_crawler()
     print(f"\nTotal new comments: {total}")
