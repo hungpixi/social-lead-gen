@@ -90,8 +90,10 @@ def cmd_leads():
         print(f"   Comment: \"{lead['comment_text'][:80]}\"")
         print(f"   Insight: {lead['insight']}")
         print(f"   Action: {lead['suggested_action']}")
+        if lead.get("post_url"):
+            print(f"   📎 Post: {lead['post_url']}")
         if lead["author_profile_url"]:
-            print(f"   Profile: {lead['author_profile_url']}")
+            print(f"   👤 Profile: {lead['author_profile_url']}")
 
 
 def cmd_crawl():

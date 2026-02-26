@@ -125,9 +125,36 @@ JS_EXTRACT_POSTS = """
             }
         }
         
-        // Post URL
-        const postLinks = container.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]');
-        const postUrl = postLinks.length > 0 ? postLinks[0].href : '';
+        // Post URL — FB dùng nhiều dạng URL khác nhau
+        let postUrl = '';
+        // Thử các pattern phổ biến
+        const urlPatterns = 'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="pcb."], a[href*="pfbid"]';
+        const postLinks = container.querySelectorAll(urlPatterns);
+        if (postLinks.length > 0) {
+            postUrl = postLinks[0].href;
+        }
+        // Fallback: timestamp link (thường là <a> chứa <abbr> hoặc text dạng "Xh" / "Xm")
+        if (!postUrl) {
+            for (const a of container.querySelectorAll('a[href*="/groups/"]')) {
+                const href = a.href || '';
+                // Link bài viết trong group thường chứa group slug + post ID
+                if (href.match(/groups\/[^/]+\/posts\/|groups\/[^/]+\/permalink\/|pfbid/)) {
+                    postUrl = href;
+                    break;
+                }
+            }
+        }
+        // Fallback 2: lấy link từ timestamp (aria-label chứa thời gian)
+        if (!postUrl) {
+            const timeLinks = container.querySelectorAll('a[aria-label]');
+            for (const a of timeLinks) {
+                const href = a.href || '';
+                if (href.includes('/groups/') && href.includes('__cft__')) {
+                    postUrl = href.split('?')[0];  // Bỏ tracking params
+                    break;
+                }
+            }
+        }
         
         results.push({
             post_id: text.substring(0, 80),

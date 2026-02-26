@@ -215,7 +215,8 @@ def get_high_intent_leads(min_score: int = 60) -> list[dict]:
     try:
         rows = conn.execute(
             """SELECT cl.*, rc.author_name, rc.author_profile_url,
-                      rc.comment_text, rc.post_content, rc.source_group
+                      rc.comment_text, rc.post_content, rc.source_group,
+                      rc.post_url
                FROM classified_leads cl
                JOIN raw_comments rc ON cl.comment_id = rc.id
                WHERE cl.quality_score >= ?
