@@ -1,0 +1,13 @@
+# Agent 1 - Crawler
+facebook-scraper==0.2.60
+Pillow==11.1.0
+
+# Agent 2 - Classifier
+requests==2.32.3
+
+# Database
+# sqlite3 is built-in
+
+# Utils
+python-dotenv==1.0.1
+loguru==0.7.3
