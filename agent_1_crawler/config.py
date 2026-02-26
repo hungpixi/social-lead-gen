@@ -7,19 +7,9 @@ Chỉnh sửa file này để thêm/xoá groups và từ khoá theo dõi.
 # Thêm URL đầy đủ của group
 GROUPS = [
     {
-        "url": "https://www.facebook.com/groups/StartupVietnam",
-        "name": "Startup Vietnam",
-        "keywords": ["AI", "startup", "khởi nghiệp", "automation", "tìm team"],
-    },
-    {
-        "url": "https://www.facebook.com/groups/nghiencuusinhhoc",
-        "name": "Khoa học Việt Nam",
-        "keywords": ["AI", "công nghệ", "nghiên cứu", "phát triển"],
-    },
-    {
-        "url": "https://www.facebook.com/groups/j2team.community",
-        "name": "J2Team Community",
-        "keywords": ["AI", "chatbot", "automation", "tool", "lập trình"],
+        "url": "https://www.facebook.com/groups/ketnoidoithi",
+        "name": "Kết nối đô thị",
+        "keywords": [],  # Lấy hết, không filter
     },
     # Thêm group mới ở đây:
     # {
