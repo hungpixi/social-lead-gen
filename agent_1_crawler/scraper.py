@@ -27,7 +27,6 @@ COOKIE_TXT_PATH = DATA_DIR / "fb_cookies.txt"
 
 # ─── Cookie Management ───────────────────────────────────
 def _parse_netscape_cookies(path: Path) -> list[dict]:
-    """Parse Netscape cookies.txt thành list dicts cho Playwright."""
     cookies = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -98,11 +97,12 @@ JS_EXTRACT_POSTS = """
         
         // Walk up DOM to find post container
         let container = msgEl;
-        for (let j = 0; j < 20; j++) {
+        for (let j = 0; j < 25; j++) {
             if (!container.parentElement) break;
-            container = container.parentElement;
-            const role = container.getAttribute('role');
+            const parent = container.parentElement;
+            const role = parent.getAttribute('role');
             if (role === 'feed' || role === 'main') break;
+            container = parent;
         }
         
         // Author (first meaningful <strong>)
@@ -125,32 +125,28 @@ JS_EXTRACT_POSTS = """
             }
         }
         
-        // Post URL — FB dùng nhiều dạng URL khác nhau
+        // Post URL — nhiều dạng
         let postUrl = '';
-        // Thử các pattern phổ biến
         const urlPatterns = 'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="pcb."], a[href*="pfbid"]';
         const postLinks = container.querySelectorAll(urlPatterns);
         if (postLinks.length > 0) {
             postUrl = postLinks[0].href;
         }
-        // Fallback: timestamp link (thường là <a> chứa <abbr> hoặc text dạng "Xh" / "Xm")
         if (!postUrl) {
             for (const a of container.querySelectorAll('a[href*="/groups/"]')) {
                 const href = a.href || '';
-                // Link bài viết trong group thường chứa group slug + post ID
-                if (href.match(/groups\/[^/]+\/posts\/|groups\/[^/]+\/permalink\/|pfbid/)) {
+                if (href.match(/groups\\/[^/]+\\/posts\\/|groups\\/[^/]+\\/permalink\\/|pfbid/)) {
                     postUrl = href;
                     break;
                 }
             }
         }
-        // Fallback 2: lấy link từ timestamp (aria-label chứa thời gian)
         if (!postUrl) {
             const timeLinks = container.querySelectorAll('a[aria-label]');
             for (const a of timeLinks) {
                 const href = a.href || '';
                 if (href.includes('/groups/') && href.includes('__cft__')) {
-                    postUrl = href.split('?')[0];  // Bỏ tracking params
+                    postUrl = href.split('?')[0];
                     break;
                 }
             }
@@ -169,57 +165,8 @@ JS_EXTRACT_POSTS = """
 }
 """
 
-JS_EXTRACT_COMMENTS = """
-(args) => {
-    const [postPrefix, maxCmt] = args;
-    const msgs = document.querySelectorAll('[data-ad-comet-preview="message"]');
-    let targetContainer = null;
-    
-    for (const msg of msgs) {
-        if (msg.innerText.trim().startsWith(postPrefix)) {
-            targetContainer = msg;
-            for (let j = 0; j < 20; j++) {
-                if (!targetContainer.parentElement) break;
-                targetContainer = targetContainer.parentElement;
-                const role = targetContainer.getAttribute('role');
-                if (role === 'feed' || role === 'main') break;
-            }
-            break;
-        }
-    }
-    
-    if (!targetContainer) return [];
-    
-    const comments = [];
-    const allText = targetContainer.querySelectorAll('ul div[dir="auto"], li div[dir="auto"]');
-    
-    for (const el of allText) {
-        const text = el.innerText.trim();
-        if (text.length < 2 || text === 'Facebook' || text.startsWith(postPrefix)) continue;
-        
-        let parent = el.parentElement;
-        let authorName = '', authorUrl = '';
-        for (let j = 0; j < 5; j++) {
-            if (!parent) break;
-            const link = parent.querySelector('a[role="link"]');
-            if (link) {
-                authorName = link.innerText.trim();
-                authorUrl = link.href || '';
-                break;
-            }
-            parent = parent.parentElement;
-        }
-        
-        if (!comments.some(c => c.text === text)) {
-            comments.push({ text: text.substring(0, 500), author: authorName, author_url: authorUrl });
-        }
-        if (comments.length >= maxCmt) break;
-    }
-    return comments;
-}
-"""
 
-
+# ─── Scroll and Collect Posts ─────────────────────────────
 def _scroll_and_collect(page, max_posts: int = 20) -> list[dict]:
     """Scroll group + extract posts bằng JS evaluate."""
     time.sleep(5)  # Chờ FB render ban đầu
@@ -258,6 +205,151 @@ def _scroll_and_collect(page, max_posts: int = 20) -> list[dict]:
     return all_posts[:max_posts]
 
 
+# ─── Click Expand Comments ────────────────────────────────
+def _click_expand_comments(page, post_text_prefix: str) -> int:
+    """Click 'View more comments' cho 1 post, trả về số nút đã click."""
+    return page.evaluate("""
+    (prefix) => {
+        const msgs = document.querySelectorAll('[data-ad-comet-preview="message"]');
+        let container = null;
+        for (const msg of msgs) {
+            if (msg.innerText.trim().substring(0, 40) === prefix.substring(0, 40)) {
+                container = msg;
+                for (let j = 0; j < 25; j++) {
+                    if (!container.parentElement) break;
+                    const p = container.parentElement;
+                    if (p.getAttribute('role') === 'feed' || p.getAttribute('role') === 'main') break;
+                    container = p;
+                }
+                break;
+            }
+        }
+        if (!container) return 0;
+        
+        let clicked = 0;
+        const btns = container.querySelectorAll('div[role="button"], span[role="button"]');
+        for (const btn of btns) {
+            const t = (btn.innerText || '').toLowerCase();
+            if (t.includes('comment') || t.includes('bình luận') || 
+                t.includes('view more') || t.includes('xem thêm') ||
+                t.includes('view all') || t.includes('phản hồi') ||
+                t.includes('more comment')) {
+                try { btn.click(); clicked++; } catch(e) {}
+            }
+        }
+        return clicked;
+    }
+    """, post_text_prefix)
+
+
+# ─── Extract Comments (JS) ───────────────────────────────
+JS_EXTRACT_COMMENTS = """
+(postPrefix) => {
+    const msgs = document.querySelectorAll('[data-ad-comet-preview="message"]');
+    let postContainer = null;
+    
+    for (const msg of msgs) {
+        if (msg.innerText.trim().substring(0, 40) === postPrefix.substring(0, 40)) {
+            postContainer = msg;
+            for (let j = 0; j < 25; j++) {
+                if (!postContainer.parentElement) break;
+                const parent = postContainer.parentElement;
+                const role = parent.getAttribute('role');
+                if (role === 'feed' || role === 'main') break;
+                postContainer = parent;
+            }
+            break;
+        }
+    }
+    
+    if (!postContainer) return [];
+    
+    const results = [];
+    const postText = postPrefix.substring(0, 30);
+    const msgEl = postContainer.querySelector('[data-ad-comet-preview="message"]');
+    
+    // Approach 1: Tìm comments trong ul > li
+    const commentLists = postContainer.querySelectorAll('ul');
+    for (const ul of commentLists) {
+        const items = ul.querySelectorAll(':scope > li, :scope > div');
+        for (const item of items) {
+            const spans = item.querySelectorAll('span[dir="auto"], div[dir="auto"]');
+            let commentText = '';
+            for (const span of spans) {
+                const t = span.innerText.trim();
+                // Bỏ qua UI text, giữ comments thật (kể cả ngắn như "ib", "quan tâm")
+                if (t.length >= 2 && t !== 'Facebook' && !t.startsWith(postText) &&
+                    t !== 'Like' && t !== 'Reply' && t !== 'Share' && t !== 'Send' &&
+                    t !== 'Thích' && t !== 'Trả lời' && t !== 'Chia sẻ' && t !== 'Gửi' &&
+                    !t.match(/^\\d+[hdwmy]$/) && !t.match(/^\\d+ (hour|day|week|month|year|giờ|ngày|tuần|tháng|năm)/) &&
+                    t.length < 500) {
+                    commentText = t;
+                    break;
+                }
+            }
+            if (!commentText || commentText.length < 2) continue;
+            
+            // Author
+            let authorName = '', authorUrl = '';
+            const links = item.querySelectorAll('a[role="link"]');
+            for (const a of links) {
+                const href = a.href || '';
+                const name = a.innerText.trim();
+                if (name.length > 1 && name.length < 50 && href.includes('facebook.com') && 
+                    !href.includes('/groups/') && name !== 'Facebook') {
+                    authorName = name;
+                    authorUrl = href;
+                    break;
+                }
+            }
+            
+            if (!results.some(r => r.text === commentText)) {
+                results.push({text: commentText, author: authorName, author_url: authorUrl});
+            }
+        }
+    }
+    
+    // Approach 2: Fallback — tìm tất cả dir=auto nằm NGOÀI message chính
+    if (results.length === 0) {
+        const allDirAuto = postContainer.querySelectorAll('div[dir="auto"], span[dir="auto"]');
+        for (const el of allDirAuto) {
+            if (msgEl && msgEl.contains(el)) continue;
+            
+            const t = el.innerText.trim();
+            if (t.length < 2 || t === 'Facebook' || t.includes('Write') || 
+                t === 'Like' || t === 'Reply' || t === 'Share' ||
+                t === 'Thích' || t === 'Trả lời' || t === 'Chia sẻ' ||
+                t === 'Comment' || t === 'Bình luận' ||
+                t.match(/^\\d+[hdwmy]$/) || t.match(/^\\d+ (comment|bình luận)/) ||
+                t.startsWith(postText)) continue;
+            
+            let authorName = '', authorUrl = '';
+            let parent = el;
+            for (let j = 0; j < 5; j++) {
+                parent = parent.parentElement;
+                if (!parent) break;
+                const link = parent.querySelector('a[role="link"]');
+                if (link) {
+                    const name = link.innerText.trim();
+                    if (name.length > 1 && name.length < 50 && name !== 'Facebook') {
+                        authorName = name;
+                        authorUrl = link.href || '';
+                        break;
+                    }
+                }
+            }
+            
+            if (!results.some(r => r.text === t) && t.length >= 2) {
+                results.push({text: t, author: authorName, author_url: authorUrl});
+            }
+        }
+    }
+    
+    return results;
+}
+"""
+
+
 # ─── Scrape Group ────────────────────────────────────────
 def scrape_group(group_id, group_name="", keywords=None, page_obj=None, context=None) -> int:
     all_comments = []
@@ -284,10 +376,22 @@ def scrape_group(group_id, group_name="", keywords=None, page_obj=None, context=
             if keywords and not any(kw.lower() in post_text.lower() for kw in keywords):
                 continue
 
-            comments = page_obj.evaluate(JS_EXTRACT_COMMENTS, [post_text[:40], MAX_COMMENTS_PER_POST])
+            # Bước 1: Click mở comments
+            prefix = post_text[:40]
+            clicked = _click_expand_comments(page_obj, prefix)
+            if clicked > 0:
+                time.sleep(2)  # Chờ FB load comments
+                # Click lần 2 nếu có "View more replies"
+                _click_expand_comments(page_obj, prefix)
+                time.sleep(1.5)
+
+            # Bước 2: Extract comments bằng JS
+            comments = page_obj.evaluate(JS_EXTRACT_COMMENTS, prefix)
+            if not isinstance(comments, list):
+                comments = []
 
             for cmt in comments:
-                if not cmt["text"].strip():
+                if not cmt.get("text", "").strip():
                     continue
                 all_comments.append({
                     "post_id": post["post_id"],
@@ -301,10 +405,9 @@ def scrape_group(group_id, group_name="", keywords=None, page_obj=None, context=
                     "source_group": group_name or group_id,
                 })
 
-            logger.debug(f"Post {i+1}: {len(comments)} cmt — '{post_text[:40]}...'")
+            logger.info(f"  Post {i+1}: {len(comments)} comments (clicked {clicked}) — '{post_text[:40]}...'")
 
-            # Nếu post không có comments → lưu post trực tiếp vào DB
-            # (để classify nội dung bài viết tìm leads)
+            # Nếu post không có comments → lưu post content
             if not comments:
                 all_comments.append({
                     "post_id": post["post_id"],
@@ -317,6 +420,7 @@ def scrape_group(group_id, group_name="", keywords=None, page_obj=None, context=
                     "has_real_avatar": 0,
                     "source_group": group_name or group_id,
                 })
+
     except Exception as e:
         logger.error(f"Scrape error: {e}")
 
