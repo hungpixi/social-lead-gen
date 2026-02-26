@@ -87,7 +87,7 @@ posts = page.evaluate("""
 | **Maintenance** | Facebook update → hỏng | DOM-based, stable |
 | **Cookie** | Netscape format only | JSON + Netscape + auto-save |
 
-## 🔬 Kết quả thực tế — Group "Kết nối đô thị"
+## 🔬 Kết quả thực tế — Group "Kết nối đội thi"
 
 ```
 📝 7 posts crawled

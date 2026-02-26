@@ -6,6 +6,7 @@ data/
 
 # Environment
 .env
+*.bat
 
 # Python
 __pycache__/

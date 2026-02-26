@@ -8,7 +8,7 @@ Chỉnh sửa file này để thêm/xoá groups và từ khoá theo dõi.
 GROUPS = [
     {
         "url": "https://www.facebook.com/groups/ketnoidoithi",
-        "name": "Kết nối đô thị",
+        "name": "Kết nối đội thi",
         "keywords": [],  # Lấy hết, không filter
     },
     # Thêm group mới ở đây:
